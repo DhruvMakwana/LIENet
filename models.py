@@ -1,275 +1,370 @@
 import torch
 import torch.nn as nn
-from torchvision import *
 import torch.nn.functional as F
+from torchsummary import summary
+from utils import getFinalImage
 
-class backbone(nn.Module):
-  def __init__(self):
-    super(backbone, self).__init__()
+class BasicConv(nn.Module):
+    def __init__(self, in_channel, out_channel, kernel_size, stride, bias=True, norm=True, activation=True, transpose=False):
+        super(BasicConv, self).__init__()
+        if bias and norm:
+            bias = False
 
-    model = models.efficientnet_b6(pretrained=True)
-    m1 = list(model.features.children())
-    self.l1 = nn.Sequential(*list(model.features.children())[:2])
-    self.l2 = nn.Sequential(*list(model.features[2][:3]))
-    self.l3 = nn.Sequential(*list(model.features[3][:4]))
-    self.l4 = nn.Sequential(*list(model.features[4][:4]))
-    self.l5 = nn.Sequential(*list(model.features[5][:2]))
-    self.l6 = nn.Sequential(*list(model.features[6][:2]))
+        padding = kernel_size // 2
+        layers = list()
+        if transpose:
+            padding = kernel_size // 2 -1
+            layers.append(nn.ConvTranspose2d(in_channel, out_channel, kernel_size, padding=padding, stride=stride, bias=bias))
+        else:
+            layers.append(
+                nn.Conv2d(in_channel, out_channel, kernel_size, padding=padding, stride=stride, bias=bias))
+        if norm:
+            layers.append(nn.InstanceNorm2d(out_channel))
+        if activation:
+            layers.append(nn.GELU())
+        self.main = nn.Sequential(*layers)
 
-  def forward(self, x):
-    x1 = self.l1(x)
-    x2 = self.l2(x1)
-    x3 = self.l3(x2)
-    x4 = self.l4(x3)
-    x5 = self.l5(x4)
-    x6 = self.l6(x5)
-    return [x1, x2, x3, x5, x6]
+    def forward(self, x):
+        return self.main(x)
 
+class RB(nn.Module):
+    def __init__(self, channels):
+        super(RB, self).__init__()
+        self.layer_1 = BasicConv(channels, channels, 3, 1)
+        self.layer_2 = BasicConv(channels, channels, 3, 1)
+        
+    def forward(self, x):
+        y = self.layer_1(x)
+        y = self.layer_2(y)
+        return y + x
 
-class ConvbnRelu(nn.Module):
-  def __init__(self, inchannels, outchannels, kernel_size=3, stride=1, padding=1):
-    super(ConvbnRelu, self).__init__()
-    self.conv = nn.Sequential(
-        nn.Conv2d(inchannels, outchannels, kernel_size, stride, padding, bias=False),
-        nn.BatchNorm2d(outchannels),
-        nn.LeakyReLU(0.2),
-    )
-  def forward(self, x):
-    return self.conv(x)
+class Down_scale(nn.Module):
+    def __init__(self, in_channel):
+        super(Down_scale, self).__init__()
+        self.main = BasicConv(in_channel, in_channel*2, 3, 2)
 
-class SEAttention(nn.Module):   #it gives channel attention
-    def __init__(self, in_channels, reduced_dim=16):  #input_shape ---> output_shape
-        super(SEAttention, self).__init__()
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1), # C x H x W -> C x 1 x 1
-            nn.Conv2d(in_channels, reduced_dim, 1),
-            nn.SiLU(),
-            nn.Conv2d(reduced_dim, in_channels, 1),
-            nn.Sigmoid(),
+    def forward(self, x):
+        return self.main(x)
+
+class Up_scale(nn.Module):
+    def __init__(self, in_channel):
+        super(Up_scale, self).__init__()
+        self.main = BasicConv(in_channel, in_channel//2, kernel_size=4, activation=True, stride=2, transpose=True)
+
+    def forward(self, x):
+        return self.main(x)
+
+class g_net(nn.Module):
+
+    def __init__(self, depth=[2, 2, 2, 2]):
+        super(g_net, self).__init__()
+
+        base_channel = 16
+        
+        # encoder
+        self.Encoder = nn.ModuleList([
+            BasicConv(base_channel, base_channel, 3, 1),
+            nn.Sequential(*[RB(base_channel) for _ in range(depth[0])]),
+            Down_scale(base_channel),
+            BasicConv(base_channel*2, base_channel*2, 3, 1),
+            nn.Sequential(*[RB(base_channel*2) for _ in range(depth[1])]),
+            Down_scale(base_channel*2),
+            BasicConv(base_channel*4, base_channel*4, 3, 1),
+            nn.Sequential(*[RB(base_channel*4) for _ in range(depth[2])]),
+            Down_scale(base_channel*4),
+        ])
+        
+        # Middle
+        self.middle = nn.Sequential(*[RB(base_channel*8) for _ in range(depth[3])])
+        
+        # decoder
+        self.Decoder = nn.ModuleList([
+            Up_scale(base_channel*8),
+            BasicConv(base_channel*8, base_channel*4, 3, 1),
+            nn.Sequential(*[RB(base_channel*4) for _ in range(depth[2])]),
+            Up_scale(base_channel*4),
+            BasicConv(base_channel*4, base_channel*2, 3, 1),
+            nn.Sequential(*[RB(base_channel*2) for _ in range(depth[1])]),
+            Up_scale(base_channel*2),
+            BasicConv(base_channel*2, base_channel, 3, 1),
+            nn.Sequential(*[RB(base_channel) for _ in range(depth[0])]),
+        ])
+
+        # conv
+        self.conv_first = BasicConv(3, base_channel, 3, 1)
+        self.conv_last = nn.Conv2d(base_channel, 1, 3, 1, 1)
+
+    def encoder(self, x):
+        shortcuts = []
+        for i in range(len(self.Encoder)):
+            x = self.Encoder[i](x)
+            if (i + 2) % 3 == 0:
+                shortcuts.append(x)
+        return x, shortcuts
+    
+    def decoder(self, x, shortcuts):
+        for i in range(len(self.Decoder)):
+            if (i + 2) % 3 == 0:
+                index = len(shortcuts) - (i//3 + 1)
+                x = torch.cat([x, shortcuts[index]], 1)
+            x = self.Decoder[i](x)
+        return x
+        
+    def forward(self, x):
+        x = self.conv_first(x)
+        x, shortcuts = self.encoder(x)
+        x =  self.middle(x)
+        x = self.decoder(x, shortcuts)
+        x = self.conv_last(x)
+        gray = (torch.tanh(x) + 1) / 2
+        return gray
+    
+class tm_net(nn.Module):
+
+    def __init__(self, depth=[2, 2, 2, 2]):
+        super(tm_net, self).__init__()
+
+        base_channel = 16
+        
+        # encoder
+        self.Encoder = nn.ModuleList([
+            BasicConv(base_channel, base_channel, 3, 1),
+            nn.Sequential(*[RB(base_channel) for _ in range(depth[0])]),
+            Down_scale(base_channel),
+            BasicConv(base_channel*2, base_channel*2, 3, 1),
+            nn.Sequential(*[RB(base_channel*2) for _ in range(depth[1])]),
+            Down_scale(base_channel*2),
+            BasicConv(base_channel*4, base_channel*4, 3, 1),
+            nn.Sequential(*[RB(base_channel*4) for _ in range(depth[2])]),
+            Down_scale(base_channel*4),
+        ])
+        
+        # Middle
+        self.middle = nn.Sequential(*[RB(base_channel*8) for _ in range(depth[3])])
+        
+        # decoder
+        self.Decoder = nn.ModuleList([
+            Up_scale(base_channel*8),
+            BasicConv(base_channel*8, base_channel*4, 3, 1),
+            nn.Sequential(*[RB(base_channel*4) for _ in range(depth[2])]),
+            Up_scale(base_channel*4),
+            BasicConv(base_channel*4, base_channel*2, 3, 1),
+            nn.Sequential(*[RB(base_channel*2) for _ in range(depth[1])]),
+            Up_scale(base_channel*2),
+            BasicConv(base_channel*2, base_channel, 3, 1),
+            nn.Sequential(*[RB(base_channel) for _ in range(depth[0])]),
+        ])
+
+        # conv
+        self.conv_first = BasicConv(3, base_channel, 3, 1)
+        self.conv_last = nn.Conv2d(base_channel, 1, 3, 1, 1)
+
+    def encoder(self, x):
+        shortcuts = []
+        for i in range(len(self.Encoder)):
+            x = self.Encoder[i](x)
+            if (i + 2) % 3 == 0:
+                shortcuts.append(x)
+        return x, shortcuts
+    
+    def decoder(self, x, shortcuts):
+        for i in range(len(self.Decoder)):
+            if (i + 2) % 3 == 0:
+                index = len(shortcuts) - (i//3 + 1)
+                x = torch.cat([x, shortcuts[index]], 1)
+            x = self.Decoder[i](x)
+        return x
+        
+    def forward(self, x):
+        x = self.conv_first(x)
+        x, shortcuts = self.encoder(x)
+        x =  self.middle(x)
+        x = self.decoder(x, shortcuts)
+        x = self.conv_last(x)
+        gray = (torch.tanh(x) + 1) / 2
+        return gray
+    
+class atmos_net(nn.Module):
+
+    def __init__(self, depth=[2, 2, 2, 2]):
+        super(atmos_net, self).__init__()
+
+        base_channel = 16
+        
+        # encoder
+        self.Encoder = nn.ModuleList([
+            BasicConv(base_channel, base_channel, 3, 1),
+            nn.Sequential(*[RB(base_channel) for _ in range(depth[0])]),
+            Down_scale(base_channel),
+            BasicConv(base_channel*2, base_channel*2, 3, 1),
+            nn.Sequential(*[RB(base_channel*2) for _ in range(depth[1])]),
+            Down_scale(base_channel*2),
+            BasicConv(base_channel*4, base_channel*4, 3, 1),
+            nn.Sequential(*[RB(base_channel*4) for _ in range(depth[2])]),
+            Down_scale(base_channel*4),
+        ])
+        
+        # Middle
+        self.middle = nn.Sequential(*[RB(base_channel*8) for _ in range(depth[3])])
+        
+        # decoder
+        self.Decoder = nn.ModuleList([
+            Up_scale(base_channel*8),
+            BasicConv(base_channel*8, base_channel*4, 3, 1),
+            nn.Sequential(*[RB(base_channel*4) for _ in range(depth[2])]),
+            Up_scale(base_channel*4),
+            BasicConv(base_channel*4, base_channel*2, 3, 1),
+            nn.Sequential(*[RB(base_channel*2) for _ in range(depth[1])]),
+            Up_scale(base_channel*2),
+            BasicConv(base_channel*2, base_channel, 3, 1),
+            nn.Sequential(*[RB(base_channel) for _ in range(depth[0])]),
+        ])
+
+        # conv
+        self.conv_first = BasicConv(3, base_channel, 3, 1)
+        self.conv_last = nn.Conv2d(base_channel, 3, 3, 1, 1)
+
+    def encoder(self, x):
+        shortcuts = []
+        for i in range(len(self.Encoder)):
+            x = self.Encoder[i](x)
+            if (i + 2) % 3 == 0:
+                shortcuts.append(x)
+        return x, shortcuts
+    
+    def decoder(self, x, shortcuts):
+        for i in range(len(self.Decoder)):
+            if (i + 2) % 3 == 0:
+                index = len(shortcuts) - (i//3 + 1)
+                x = torch.cat([x, shortcuts[index]], 1)
+            x = self.Decoder[i](x)
+        return x
+        
+    def forward(self, x):
+        x = self.conv_first(x)
+        x, shortcuts = self.encoder(x)
+        x =  self.middle(x)
+        x = self.decoder(x, shortcuts)
+        x = self.conv_last(x)
+        x = F.avg_pool2d(x, (x.shape[2], x.shape[3]))
+        x = x.view(x.shape[0], -1)
+        gray = (torch.tanh(x) + 1) / 2
+        return gray
+
+class refine_net(nn.Module):
+
+    def __init__(self, depth=[2, 2, 2, 2]):
+        super(refine_net, self).__init__()
+
+        base_channel = 16
+        
+        # encoder
+        self.Encoder = nn.ModuleList([
+            BasicConv(base_channel, base_channel, 3, 1),
+            nn.Sequential(*[RB(base_channel) for _ in range(depth[0])]),
+            Down_scale(base_channel),
+            BasicConv(base_channel*2, base_channel*2, 3, 1),
+            nn.Sequential(*[RB(base_channel*2) for _ in range(depth[1])]),
+            Down_scale(base_channel*2),
+            BasicConv(base_channel*4, base_channel*4, 3, 1),
+            nn.Sequential(*[RB(base_channel*4) for _ in range(depth[2])]),
+            Down_scale(base_channel*4),
+        ])
+        
+        # Middle
+        self.middle = nn.Sequential(*[RB(base_channel*8) for _ in range(depth[3])])
+        
+        # decoder
+        self.Decoder = nn.ModuleList([
+            Up_scale(base_channel*8),
+            BasicConv(base_channel*8, base_channel*4, 3, 1),
+            nn.Sequential(*[RB(base_channel*4) for _ in range(depth[2])]),
+            Up_scale(base_channel*4),
+            BasicConv(base_channel*4, base_channel*2, 3, 1),
+            nn.Sequential(*[RB(base_channel*2) for _ in range(depth[1])]),
+            Up_scale(base_channel*2),
+            BasicConv(base_channel*2, base_channel, 3, 1),
+            nn.Sequential(*[RB(base_channel) for _ in range(depth[0])]),
+        ])
+
+        # conv
+        self.conv_first = BasicConv(7, base_channel, 3, 1)
+        self.conv_last = nn.Conv2d(base_channel, 3, 3, 1, 1)
+
+    def encoder(self, x):
+        shortcuts = []
+        for i in range(len(self.Encoder)):
+            x = self.Encoder[i](x)
+            if (i + 2) % 3 == 0:
+                shortcuts.append(x)
+        return x, shortcuts
+    
+    def decoder(self, x, shortcuts):
+        for i in range(len(self.Decoder)):
+            if (i + 2) % 3 == 0:
+                index = len(shortcuts) - (i//3 + 1)
+                x = torch.cat([x, shortcuts[index]], 1)
+            x = self.Decoder[i](x)
+        return x
+        
+    def forward(self, x):
+        x = self.conv_first(x)
+        x, shortcuts = self.encoder(x)
+        x =  self.middle(x)
+        x = self.decoder(x, shortcuts)
+        x = self.conv_last(x)
+        gray = (torch.tanh(x) + 1) / 2
+        return gray
+
+class LIENet(nn.Module):
+    def __init__(self):
+        super(LIENet, self).__init__()
+        self.g_net = g_net()
+        self.tm_net = tm_net()
+        self.atmos_net = atmos_net()
+        self.refine_net = refine_net()
+
+    def forward(self, x):
+        gray = self.g_net(x)
+        tm = self.tm_net(x)
+        atmos = self.atmos_net(x)
+        coarsemap = getFinalImage(x, atmos, tm)
+        out = self.refine_net(torch.cat([x, gray, coarsemap], 1))
+        return gray, tm, atmos, coarsemap, out
+
+class Discriminator(nn.Module):
+    def __init__(self, channels_img=5, features_d=16):
+        super(Discriminator, self).__init__()
+        self.disc = nn.Sequential(
+            # input: N x channels_img x 64 x 64
+            nn.Conv2d(channels_img, features_d, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            # _block(in_channels, out_channels, kernel_size, stride, padding)
+            self._block(features_d, features_d * 2, 4, 2, 1),
+            self._block(features_d * 2, features_d * 4, 4, 2, 1),
+            self._block(features_d * 4, features_d * 8, 4, 2, 1),
+            # After all _block img output is 4x4 (Conv2d below makes into 1x1)
+            nn.Conv2d(features_d * 8, features_d*4, kernel_size=4, stride=2, padding=0),
+        )
+
+    def _block(self, in_channels, out_channels, kernel_size, stride, padding):
+        return nn.Sequential(
+            nn.Conv2d(
+                in_channels, out_channels, kernel_size, stride, padding, bias=False,
+            ),
+            nn.InstanceNorm2d(out_channels, affine=True),
+            nn.LeakyReLU(0.2),
         )
 
     def forward(self, x):
-        return x * self.se(x)
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_c, out_c):
-        super(ResidualBlock, self).__init__()
-
-        self.c1 = ConvbnRelu(inchannels=in_c, outchannels=out_c)
-        self.c2 = ConvbnRelu(inchannels=out_c, outchannels=out_c)
-        self.c3 = nn.Conv2d(in_c, out_c, kernel_size=1, padding=0)
-        self.bn3 = nn.BatchNorm2d(out_c)
-        self.se = SEAttention(in_channels=out_c)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        # print(x.shape)
-        x1 = self.c1(x)
-        x2 = self.c2(x1)
-        x3 = self.c3(x)
-        x3 = self.bn3(x3)
-        x3 = self.se(x3)
-        x4 = x2 + x3
-        x4 = self.relu(x4)
-        return x4
-
-class EncoderBlock(nn.Module):
-    def __init__(self, in_c, out_c):
-        super(EncoderBlock, self).__init__()
-
-        self.r1 = ResidualBlock(in_c, out_c)
-        self.pool = nn.AvgPool2d(2, stride=2)
-
-    def forward(self, x):
-        x = self.r1(x)
-        p = self.pool(x)
-        return x, p
-
-class DecoderBlock(nn.Module):
-    def __init__(self, in_c, skip_c, out_c):
-        super(DecoderBlock, self).__init__()
-
-        self.upsample = nn.ConvTranspose2d(in_c, out_c, kernel_size=4, stride=2, padding=1)
-        self.r1 = ResidualBlock(skip_c+out_c, out_c)
-        # self.r2 = ResidualBlock(out_c, out_c)
-
-    def forward(self, x, s):
-        x = self.upsample(x)
-        x = torch.cat([x, s], axis=1)
-        x = self.r1(x)
-        # x = self.r2(x)
-        return x
-
-class GBlock(nn.Module):
-    def __init__(self, in_c, out_c):
-        super(GBlock, self).__init__()
-
-        self.c = nn.Conv2d(in_c+in_c, out_c, 1)
-        self.sig = nn.Sigmoid()
-
-    def forward(self, x1, x2, x3):
-        x = torch.cat([x1, x2], axis=1)
-        x = self.c(x)
-        x = self.sig(x)
-        x = x * x3
-        return x
-
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DoubleConv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-class Refinement(nn.Module):
-    def __init__(
-            self, in_channels=3, out_channels=1, features=[16, 32, 64, 128],
-    ):
-        super(Refinement, self).__init__()
-        self.ups = nn.ModuleList()
-        self.downs = nn.ModuleList()
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-
-        # Down part of UNET
-        for feature in features:
-            self.downs.append(DoubleConv(in_channels, feature))
-            in_channels = feature
-
-        # Up part of UNET
-        for feature in reversed(features):
-            self.ups.append(
-                nn.ConvTranspose2d(
-                    feature*2, feature, kernel_size=2, stride=2,
-                )
-            )
-            self.ups.append(DoubleConv(feature*2, feature))
-
-        self.bottleneck = DoubleConv(features[-1], features[-1]*2)
-        self.final_conv = nn.Sequential(
-            nn.Conv2d(features[0], out_channels, kernel_size=1),
-            nn.Sigmoid()
-            )
-
-    def forward(self, x):
-        skip_connections = []
-
-        for down in self.downs:
-            x = down(x)
-            skip_connections.append(x)
-            x = self.pool(x)
-
-        x = self.bottleneck(x)
-        skip_connections = skip_connections[::-1]
-
-        for idx in range(0, len(self.ups), 2):
-            x = self.ups[idx](x)
-            skip_connection = skip_connections[idx//2]
-
-            if x.shape != skip_connection.shape:
-                x = F.resize(x, size=skip_connection.shape[2:])
-
-            concat_skip = torch.cat((skip_connection, x), dim=1)
-            x = self.ups[idx+1](concat_skip)
-
-        return self.final_conv(x)
-
-class LIE_Prior(nn.Module):
-  def __init__(self):
-    super(LIE_Prior, self).__init__()
-    
-    self.backbone = backbone()
-    self.refine = Refinement(in_channels=4, out_channels=3)
-
-    self.ld1 = DecoderBlock(in_c=344, skip_c=200, out_c=256)
-    self.hd1 = DecoderBlock(in_c=344, skip_c=200, out_c=256)
-    self.id1 = DecoderBlock(in_c=344, skip_c=200, out_c=256)
-    self.g1 = GBlock(in_c=256, out_c=256)
-
-    self.ld2 = DecoderBlock(in_c=256, skip_c=72, out_c=128)
-    self.hd2 = DecoderBlock(in_c=256, skip_c=72, out_c=128)
-    self.id2 = DecoderBlock(in_c=256, skip_c=72, out_c=128)
-    self.g2 = GBlock(in_c=128, out_c=128)
-
-    self.ld3 = DecoderBlock(in_c=128, skip_c=40, out_c=64)
-    self.hd3 = DecoderBlock(in_c=128, skip_c=40, out_c=64)
-    self.id3 = DecoderBlock(in_c=128, skip_c=40, out_c=64)
-    self.g3 = GBlock(in_c=64, out_c=64)
-
-    self.ld4 = DecoderBlock(in_c=64, skip_c=32, out_c=32)
-    self.hd4 = DecoderBlock(in_c=64, skip_c=32, out_c=32)
-    self.id4 = DecoderBlock(in_c=64, skip_c=32, out_c=32)
-    self.g4 = GBlock(in_c=32, out_c=32)
-
-    self.ld5 =  nn.Sequential(  nn.ConvTranspose2d(32, 32, kernel_size=4, stride=2, padding=1),
-                                nn.Conv2d(32, 1, 3, 1, 1),
-                                nn.Sigmoid()
-                            )#ResidualBlock(in_c=32, out_c=3, last=True)
-    self.hd5 = nn.Sequential(   nn.ConvTranspose2d(32, 32, kernel_size=4, stride=2, padding=1),
-                                nn.Conv2d(32, 1, 3, 1, 1),
-                                nn.Sigmoid()
-                            )#ResidualBlock(in_c=32, out_c=1, last=True)
-    self.id5 = nn.Sequential(   nn.ConvTranspose2d(32, 32, kernel_size=4, stride=2, padding=1),
-                                nn.Conv2d(32, 3, 3, 1, 1),
-                                nn.Sigmoid()
-                            )#ResidualBlock(in_c=32, out_c=3, last=True)
-    
-    self.sigmoid = nn.Sigmoid()
-
-  def forward(self, x):
-
-    x1, x2, x3, x4, x5 = self.backbone(x)
-
-    """block 1"""
-    l1 = self.ld1(x5,x4)  
-    h1 = self.hd1(x5,x4)  
-    i1 = self.id1(x5,x4) 
-    i1 = self.g1(l1,h1,i1)
-
-    """block 2"""
-    l2 = self.ld2(l1,x3)  
-    h2 = self.hd2(h1,x3)  
-    i2 = self.id2(i1,x3) 
-    i2 = self.g2(l2,h2,i2)
-
-    """block 3"""
-    l3 = self.ld3(l2,x2)  
-    h3 = self.hd3(h2,x2)  
-    i3 = self.id3(i2,x2) 
-    i3 = self.g3(l3,h3,i3)
-
-    """block 4"""
-    l4 = self.ld4(l3,x1)  
-    h4 = self.hd4(h3,x1)  
-    i4 = self.id4(i3,x1) 
-    i4 = self.g4(l4,h4,i4)
-
-    """block 5 [last block]"""
-    l5 = self.ld5(l4)
-    h5 = self.hd5(h4)
-    i5 = self.id5(i4)
-    i5 = F.avg_pool2d(i5, (i5.shape[2], i5.shape[3]))
-
-    out = (x - ((1.0 - h5) * i5)) / (h5)
-    out = self.sigmoid(out)
-    out = self.refine(torch.cat([l5, out], 1))
-
-    return l5,h5,i5,out
+        return self.disc(x)
 
 def test():
-    from torchsummary import summary
+    model = LIENet().to("cuda")
     x = torch.randn((1, 3, 512, 512)).to("cuda")
-    model = LIE_Prior().to("cuda")
-    gray_pred, tm_pred, atmos_pred, out_pred = model(x)
+    gray_pred, tm_pred, atmos_pred, refined_map, out_pred = model(x)
     print(summary(model, (3, 512, 512)))
-    print(gray_pred.shape, tm_pred.shape, atmos_pred.shape, out_pred.shape)
+    print(gray_pred.shape, tm_pred.shape, atmos_pred.shape, refined_map.shape, out_pred.shape)
 
 if __name__ == "__main__":
     test()
