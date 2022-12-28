@@ -17,17 +17,17 @@ def seed_everything(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def save_some_examples(model, val_loader, epoch, folder):
-    low_image_rgb, normal_image_rgb, normal_image_gray = next(iter(val_loader))
-    low_image_rgb, normal_image_rgb, normal_image_gray = low_image_rgb.to(config.DEVICE), normal_image_rgb.to(config.DEVICE), normal_image_gray.to(config.DEVICE)
-    model.eval()
+def save_some_examples(gen, val_loader, epoch, folder):
+    low_image_rgb, normal_image_rgb, _ = next(iter(val_loader))
+    low_image_rgb, normal_image_rgb = low_image_rgb.to(config.DEVICE), normal_image_rgb.to(config.DEVICE)
+    gen.eval()
     with torch.no_grad():
-        _, _, _, normal_pred = model(low_image_rgb)
+        _, _, _, _, normal_pred = gen(low_image_rgb)
         save_image(normal_pred, folder + f"/y_recon_{epoch}.png")
         save_image(low_image_rgb, folder + f"/input_{epoch}.png")
         if epoch == 1:
             save_image(normal_image_rgb, folder + f"/label_{epoch}.png")
-    model.train()
+    gen.train()
 
 def save_checkpoint(model, optimizer, filename="my_checkpoint.pth"):
     checkpoint = {
@@ -59,10 +59,11 @@ def getFinalImage(input_image, atmosphere_light, refined_tranmission_map):
     input_image = input_image.permute(0, 2, 3, 1)
     refined_image = torch.empty(size=input_image.shape, dtype=input_image.dtype, device=input_image.device)
     for batch in range(input_image.shape[0]):
+        # breakpoint()
         refined_image[batch, :, :, :] = (input_image[batch] - (1.0 - refined_tranmission_map_broadcasted[batch]) * atmosphere_light[batch]) / (torch.where(refined_tranmission_map_broadcasted[batch] < config.TMIN, config.TMIN, refined_tranmission_map_broadcasted[batch]))
     return ((refined_image - refined_image.min())/(refined_image.max() - refined_image.min())).permute(0, 3, 1, 2)
 
-def getTransmissionMap(input_image, atmosphere_light, dark_channel_prior, bright_channel_prior):
+def getTransmissionMap(input_image, atmosphere_light, dark_channel_prior, bright_channel_prior, initial_transmission_map):
     """
     input_image: (1x3x256x256) = NCHW
     atmosphere_light: (1x3) = NC
@@ -74,7 +75,20 @@ def getTransmissionMap(input_image, atmosphere_light, dark_channel_prior, bright
     dark_channel_transmissionmap, _ = getIlluminationChannel(img)
     dark_channel_transmissionmap = dark_channel_transmissionmap
     dark_channel_transmissionmap = 1.0 - config.OMEGA * dark_channel_transmissionmap
-    return torch.abs(dark_channel_transmissionmap)
+    corrected_transmission_map = initial_transmission_map
+    difference_channel_prior = bright_channel_prior - dark_channel_prior
+    indices = difference_channel_prior < config.ALPHA
+    corrected_transmission_map[indices] = dark_channel_transmissionmap[indices] * initial_transmission_map[indices]
+    return torch.abs(corrected_transmission_map)
+
+def getInitialTransmissionMap(atmosphere_light, bright_channel_prior):
+    """
+    atmosphere_light: (1x3) = NC
+    bright_channel_prior: (1x1x256x256) = NCHW
+    initial_transmission_map: (1x1x256x256) = NCHW
+    """
+    initial_transmission_map = (bright_channel_prior - torch.max(atmosphere_light)) / (1.0 - torch.max(atmosphere_light))
+    return (initial_transmission_map - torch.min(initial_transmission_map))/(torch.max(initial_transmission_map) - torch.min(initial_transmission_map))
 
 def getGlobalAtmosphereLight(input_image, bright_channel_prior, probability=0.1):
     """
@@ -105,12 +119,12 @@ def getIlluminationChannel(input_image):
 def getRefinedImage(low_image_rgb, normal_image_rgb):
     low_image_rgb = low_image_rgb.to("cuda")
     normal_image_rgb = normal_image_rgb.to("cuda")
-    dark_channel_prior, bright_channel_prior = getIlluminationChannel(low_image_rgb)
-    atmosphere_light = getGlobalAtmosphereLight(low_image_rgb, bright_channel_prior)
-    transmission_map = getTransmissionMap(low_image_rgb, atmosphere_light, dark_channel_prior, bright_channel_prior)
-    # normalised_image = (low_image_rgb - low_image_rgb.min()) / (low_image_rgb.max() - low_image_rgb.min())
+    input_image = (low_image_rgb + normal_image_rgb) / 2.0
+    dark_channel_prior, bright_channel_prior = getIlluminationChannel(input_image)
+    atmosphere_light = getGlobalAtmosphereLight(input_image, bright_channel_prior)
+    initial_transmission_map = getInitialTransmissionMap(atmosphere_light, bright_channel_prior)
+    transmission_map = getTransmissionMap(input_image, atmosphere_light, dark_channel_prior, bright_channel_prior, initial_transmission_map)
     refined_image = getFinalImage(low_image_rgb, atmosphere_light, transmission_map)
-    # refined_image = (low_image_rgb - ((1.0 - transmission_map) * atmosphere_light)) / (transmission_map)
     return transmission_map, atmosphere_light, refined_image
 
 # psnr
@@ -122,3 +136,24 @@ def calculate_psnr(img1, img2):
     if mse == 0:
         return float('inf')
     return 20 * math.log10(255.0 / math.sqrt(mse))
+
+def gradient_penalty(critic, real, fake, device="cpu"):
+    BATCH_SIZE, C, H, W = real.shape
+    alpha = torch.rand((BATCH_SIZE, 1, 1, 1)).repeat(1, C, H, W).to(device)
+    interpolated_images = real * alpha + fake * (1 - alpha)
+
+    # Calculate critic scores
+    mixed_scores = critic(interpolated_images)
+
+    # Take the gradient of the scores with respect to the images
+    gradient = torch.autograd.grad(
+        inputs=interpolated_images,
+        outputs=mixed_scores,
+        grad_outputs=torch.ones_like(mixed_scores),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+    gradient = gradient.view(gradient.shape[0], -1)
+    gradient_norm = gradient.norm(2, dim=1)
+    gradient_penalty = torch.mean((gradient_norm - 1) ** 2)
+    return gradient_penalty
